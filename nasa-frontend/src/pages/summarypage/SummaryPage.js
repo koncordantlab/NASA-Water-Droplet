@@ -3,6 +3,7 @@ import PercentageChart from "./summaryVisuals/PercentageChart";
 import OverlapChart from "./summaryVisuals/OverlapChart";
 import Slider from "../../components/slider/Slider";
 import PieCharts from "./summaryVisuals/PieCharts";
+import SizeDistribution from "./summaryVisuals/SizeDistribution";
 
 import "./summaryPage.css"
 
@@ -17,7 +18,8 @@ const SummaryPage = ({
     chartRenderElapsed,
     plotsRendered,
     plotsToRender,
-    executionTime
+    executionTime,
+    sizeDistribution
 }) => {
     const dynamicText = computeDynamicSummary(rows, overlaps);
 
@@ -86,6 +88,8 @@ const SummaryPage = ({
         <div style={{ width: "95%", margin: "2rem auto", textAlign: "center" }}>
           <PieCharts chart={chart} markPlotRendered={markPlotRendered}/>
         </div>
+
+        <SizeDistribution sizeDistribution={sizeDistribution} />
 
         <div id="overlap-summary" style={{ width: "95%", margin: "2rem auto", fontSize: 18 }}>
           <h4 style={{ textAlign: "center" }}>Overlap Summary</h4>

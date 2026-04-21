@@ -55,5 +55,50 @@ const donutFigure = (labels, values, title) => ({
     },
   });
 
-export { buildOverlappingFigure, buildPercentageFigure, donutFigure };
+const buildSizeHistogramFigure = (block, color, title, yMax) => {
+    if (!block || !block.histogram) return null;
+    const edges = block.histogram.bin_edges || [];
+    const counts = block.histogram.counts || [];
+    const yRangeTop = yMax && yMax > 0 ? Math.ceil(yMax * 1.1) : null;
+    if (counts.length === 0) {
+        return {
+            data: [],
+            layout: {
+                title: { text: `${title} (no detections)`, font: { size: 14 } },
+                margin: { t: 40 },
+                yaxis: yRangeTop ? { title: "Count", range: [0, yRangeTop] } : { title: "Count" },
+            },
+            config: { responsive: true, displayModeBar: false },
+        };
+    }
+    const centers = [];
+    const widths = [];
+    for (let i = 0; i < counts.length; i++) {
+        const lo = edges[i];
+        const hi = edges[i + 1] != null ? edges[i + 1] : lo + 1;
+        centers.push((lo + hi) / 2);
+        widths.push(hi - lo);
+    }
+    return {
+        data: [{
+            x: centers,
+            y: counts,
+            width: widths,
+            type: "bar",
+            marker: { color },
+            name: title,
+            hovertemplate: "size: %{x:.2f} px<br>count: %{y}<extra></extra>",
+        }],
+        layout: {
+            title: { text: title, font: { size: 14 } },
+            margin: { t: 40, b: 50 },
+            xaxis: { title: "Major-axis length (px)" },
+            yaxis: yRangeTop ? { title: "Count", range: [0, yRangeTop] } : { title: "Count" },
+            bargap: 0.05,
+        },
+        config: { responsive: true, displayModeBar: false },
+    };
+};
+
+export { buildOverlappingFigure, buildPercentageFigure, donutFigure, buildSizeHistogramFigure };
 

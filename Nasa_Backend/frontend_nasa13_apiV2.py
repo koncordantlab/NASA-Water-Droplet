@@ -186,25 +186,100 @@ def display_page(pathname):
 app.clientside_callback("function(n_clicks) { if (!n_clicks) return ''; return window.prompt('Enter video file path:'); }", Output("folder-input", "value"), Input("folder-picker-btn", "n_clicks"))
 
 # ── 7) run_detection (Updated for BATCH PROCESSING) ────────────────────────
-def process_video(video_path: str, save_ovl: bool = True, progress_callback = None):
-    """Process the video and return (msg, excel_path, rows, overlap_totals, charts, execution_time)
+SIZE_DIST_BINS = 30
+
+
+def _major_axis_length(binary_mask):
+    """Length of the longest side of the minimum rotated bounding rectangle
+    around the largest contour in a binary mask. Captures real droplet
+    extent for elongated/irregular shapes (unlike equivalent-circular diameter).
+    """
+    contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 0.0
+    largest = max(contours, key=cv2.contourArea)
+    if len(largest) < 2:
+        return 0.0
+    (_, _), (w_rect, h_rect), _ = cv2.minAreaRect(largest)
+    return float(max(w_rect, h_rect))
+
+
+def _shared_bin_edges(all_values):
+    """Return common histogram edges for all checkpoints of a single class.
+    Falls back to a synthetic single-bin range if the data is degenerate.
+    Returns None when there are no values at all (caller should treat as empty).
+    """
+    if not all_values:
+        return None
+    arr = np.asarray(all_values, dtype=float)
+    if arr.size == 1 or arr.min() == arr.max():
+        return np.array([float(arr.min()), float(arr.min()) + 1.0])
+    return np.histogram_bin_edges(arr, bins=SIZE_DIST_BINS)
+
+
+def _droplet_stats_block(diameters, edges=None):
+    arr = np.asarray(diameters, dtype=float)
+    if arr.size == 0:
+        if edges is not None and len(edges) > 1:
+            return {
+                "count": 0,
+                "stats": {"min": None, "max": None, "mean": None, "median": None, "std": None},
+                "histogram": {
+                    "bin_edges": [round(float(e), 2) for e in edges],
+                    "counts": [0] * (len(edges) - 1),
+                },
+            }
+        return {
+            "count": 0,
+            "stats": {"min": None, "max": None, "mean": None, "median": None, "std": None},
+            "histogram": {"bin_edges": [], "counts": []},
+        }
+    if edges is not None and len(edges) > 1:
+        counts, used_edges = np.histogram(arr, bins=edges)
+    elif arr.size == 1 or arr.min() == arr.max():
+        used_edges = np.array([float(arr.min()), float(arr.min()) + 1.0])
+        counts = np.array([int(arr.size)])
+    else:
+        counts, used_edges = np.histogram(arr, bins=SIZE_DIST_BINS)
+    return {
+        "count": int(arr.size),
+        "stats": {
+            "min": round(float(arr.min()), 2),
+            "max": round(float(arr.max()), 2),
+            "mean": round(float(arr.mean()), 2),
+            "median": round(float(np.median(arr)), 2),
+            "std": round(float(arr.std()), 2),
+        },
+        "histogram": {
+            "bin_edges": [round(float(e), 2) for e in used_edges],
+            "counts": [int(c) for c in counts],
+        },
+    }
+
+
+def process_video(video_path: str, save_ovl: bool = True, dist_interval: int = 0, progress_callback = None):
+    """Process the video and return (msg, excel_path, rows, overlap_totals, charts, execution_time, size_distribution)
 
     charts is a dict containing JSON-friendly arrays for plotting:
       - pct: {'x': [...], 'water': [...], 'ice': [...]}
-      - ov: {'x': [...], 'ww': [...], 'ii': [...], 'wi': [...]} 
+      - ov: {'x': [...], 'ww': [...], 'ii': [...], 'wi': [...]}
       - donuts: {'water_count': int, 'ice_count': int, 'void_pct_avg': float, 'avg_conf': float}
+
+    size_distribution (None when dist_interval <= 0): per-class droplet equivalent-diameter
+    distributions sampled at processed frames N, 2N, 3N, ..., plus the final processed frame.
+      - {"interval": int, "unit": str, "checkpoints": [{"frame": int, "water": {...}, "ice": {...}}, ...]}
     """
     start_time = time.time()
     if not video_path or not os.path.isfile(video_path):
         if progress_callback:
             progress_callback({"status": "error", "message": f"Invalid video file path: {video_path}"})
-        return (f"❌ Invalid video file path: {video_path}", None, None, None, None)
+        return (f"❌ Invalid video file path: {video_path}", None, None, None, None, None, None)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         if progress_callback:
             progress_callback({"status": "error", "message": f"Could not open video file: {video_path}"})
-        return (f"❌ Error: Could not open video file {video_path}", None, None, None, None)
+        return (f"❌ Error: Could not open video file {video_path}", None, None, None, None, None, None)
 
     video_fps = cap.get(cv2.CAP_PROP_FPS)
     print("Video FPS:", video_fps)
@@ -240,9 +315,11 @@ def process_video(video_path: str, save_ovl: bool = True, progress_callback = No
 
         rows, overlap_totals = [], {"ww": 0, "ii": 0, "mixed": 0}
         frame_count, processed_frame_count = 0, 0
+        size_checkpoints_raw = []  # list of (frame, water_diams, ice_diams)
+        last_frame_diams = {"frame": 0, "water": [], "ice": []}
 
         def process_batch(batch_frames, batch_counts):
-            nonlocal rows, overlap_totals
+            nonlocal rows, overlap_totals, size_checkpoints_raw, last_frame_diams
             results_list = model(batch_frames, imgsz=640, verbose=False)
 
             for i, res in enumerate(results_list):
@@ -253,6 +330,7 @@ def process_video(video_path: str, save_ovl: bool = True, progress_callback = No
                 water_cnt, ice_cnt, water_area, ice_area = 0, 0, 0, 0
                 confs = []
                 ww_count, ii_count, wi_count = 0, 0, 0
+                frame_water_diams, frame_ice_diams = [], []
 
                 if res.masks is not None and len(res.boxes):
                     masks_np = res.masks.data.cpu().numpy()
@@ -263,12 +341,17 @@ def process_video(video_path: str, save_ovl: bool = True, progress_callback = No
                         full_m = cv2.resize(fm, (w, h), interpolation=cv2.INTER_NEAREST)
                         area = full_m.sum()
                         cls_name = res.names[int(box.cls)].lower()
+                        diameter = _major_axis_length(full_m) if area > 0 else 0.0
                         if cls_name == "water":
                             water_cnt += 1
                             water_area += area
+                            if diameter > 0:
+                                frame_water_diams.append(diameter)
                         elif cls_name == "ice":
                             ice_cnt += 1
                             ice_area += area
+                            if diameter > 0:
+                                frame_ice_diams.append(diameter)
                         confs.append(box.conf.item())
 
                     full_masks_for_overlap = [cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST) for m in bin_masks]
@@ -312,6 +395,18 @@ def process_video(video_path: str, save_ovl: bool = True, progress_callback = No
                     "water_pixel_area": water_area,
                     "ice_pixel_area": ice_area,
                 })
+
+                last_frame_diams = {
+                    "frame": current_processed_frame,
+                    "water": frame_water_diams,
+                    "ice": frame_ice_diams,
+                }
+                if dist_interval > 0 and current_processed_frame % dist_interval == 0:
+                    size_checkpoints_raw.append((
+                        current_processed_frame,
+                        list(frame_water_diams),
+                        list(frame_ice_diams),
+                    ))
                 if progress_callback:
                     progress_callback({
                         "status": "processing", 
@@ -347,7 +442,7 @@ def process_video(video_path: str, save_ovl: bool = True, progress_callback = No
         if not rows:
             if progress_callback:
                 progress_callback({"status": "completed", "message": "Video processed, but no objects were detected."})
-            return ("Video processed, but no objects were detected.", None, rows, overlap_totals, None)
+            return ("Video processed, but no objects were detected.", None, rows, overlap_totals, None, None, None)
 
         df = pd.DataFrame(rows)
         excel_path = os.path.join(base_dir, f"{video_fname_base}_detection_summary.xlsx")
@@ -366,19 +461,55 @@ def process_video(video_path: str, save_ovl: bool = True, progress_callback = No
             "donuts": {"water_count": int(df["water_cnt"].sum()), "ice_count": int(df["ice_cnt"].sum()), "void_pct_avg": float(df["void_pct"].mean()), "avg_conf": float(df["avg_conf"].mean())}
         }
 
+        size_distribution = None
+        if dist_interval > 0:
+            if not size_checkpoints_raw or size_checkpoints_raw[-1][0] != last_frame_diams["frame"]:
+                size_checkpoints_raw.append((
+                    last_frame_diams["frame"],
+                    list(last_frame_diams["water"]),
+                    list(last_frame_diams["ice"]),
+                ))
+            all_water = [d for _, w_d, _ in size_checkpoints_raw for d in w_d]
+            all_ice = [d for _, _, i_d in size_checkpoints_raw for d in i_d]
+            water_edges = _shared_bin_edges(all_water)
+            ice_edges = _shared_bin_edges(all_ice)
+            checkpoints = [
+                {
+                    "frame": int(frame),
+                    "water": _droplet_stats_block(w_d, edges=water_edges),
+                    "ice": _droplet_stats_block(i_d, edges=ice_edges),
+                }
+                for frame, w_d, i_d in size_checkpoints_raw
+            ]
+            water_y_max = max(
+                (max(cp["water"]["histogram"]["counts"], default=0) for cp in checkpoints),
+                default=0,
+            )
+            ice_y_max = max(
+                (max(cp["ice"]["histogram"]["counts"], default=0) for cp in checkpoints),
+                default=0,
+            )
+            size_distribution = {
+                "interval": int(dist_interval),
+                "unit": "pixels (major axis)",
+                "bin_count": SIZE_DIST_BINS,
+                "y_max": {"water": int(water_y_max), "ice": int(ice_y_max)},
+                "checkpoints": checkpoints,
+            }
+
         end_time = time.time()
         print(f"✅ Processing complete! Elapsed time: {end_time - start_time:.2f} seconds")
         # execution time in seconds (rounded to 2 decimal places)
         execution_time = round(end_time - start_time, 2)
         if progress_callback:
-            progress_callback({"status": "completed", "message": "Processing complete.", "execution_time": execution_time, "excel_path": excel_path, "charts": charts, "rows": rows, "overlap_totals": overlap_totals})
-        return ("✅ Processing complete!", excel_path, rows, overlap_totals, charts, execution_time)
+            progress_callback({"status": "completed", "message": "Processing complete.", "execution_time": execution_time, "excel_path": excel_path, "charts": charts, "rows": rows, "overlap_totals": overlap_totals, "size_distribution": size_distribution})
+        return ("✅ Processing complete!", excel_path, rows, overlap_totals, charts, execution_time, size_distribution)
 
     except Exception as e:
         print(f"An error occurred: {e}")
         if progress_callback:
             progress_callback({"status": "error", "message": f"An error occurred during processing: {e}"})
-        return (f"❌ An error occurred during processing: {e}", None, None, None, None)
+        return (f"❌ An error occurred during processing: {e}", None, None, None, None, None, None)
 
     finally:
         if cap:
@@ -398,6 +529,12 @@ def api_process():
     data = request.get_json(force=True, silent=True) or {}
     video_path = data.get('video_path')
     save_ovl = data.get('save_overlay', True)
+    try:
+        dist_interval = int(data.get('dist_interval', 0) or 0)
+    except (TypeError, ValueError):
+        dist_interval = 0
+    if dist_interval < 0:
+        dist_interval = 0
     if not video_path:
         return jsonify({"status": "error", "message": "Missing video_path"}), 400
     
@@ -416,7 +553,7 @@ def api_process():
                     except Exception:
                         pass
             
-            msg, excel_path, rows, overlaps, charts, execution_time = process_video(video_path, save_ovl, progress_callback=push)
+            msg, excel_path, rows, overlaps, charts, execution_time, size_distribution = process_video(video_path, save_ovl, dist_interval=dist_interval, progress_callback=push)
             result_payload = {
                 "status": "ok" if excel_path else "error",
                 "message": str(msg),
@@ -426,6 +563,7 @@ def api_process():
                 "excel_path": str(excel_path) if excel_path else None,
                 "download_url": url_for('api_download_summary', path=excel_path, _external=True) if excel_path else None,
                 "execution_time": execution_time,
+                "size_distribution": make_json_serializable(size_distribution) if size_distribution else None,
             }
             task_queue.put_nowait({"status": "finished", "data": result_payload})
         except Exception as e:

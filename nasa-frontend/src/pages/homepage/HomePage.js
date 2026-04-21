@@ -14,6 +14,7 @@ const HomePage = ({
 
     const [videoPath, setVideoPath] = useState("")
     const [isSegmentationOn, setIsSegmentationOn] = useState(true)
+    const [distInterval, setDistInterval] = useState(0)
 
     const handleTextInputChange = (e) => {
         setVideoPath(e.target.value)
@@ -69,10 +70,27 @@ const HomePage = ({
                 </label>
                 <span className="switch-text">Save Segmentation overlay video</span>
             </div>
+            <div className="dist-interval-input" style={{ marginTop: 12 }}>
+                <label htmlFor="dist-interval-field" className="switch-text" style={{ marginRight: 8 }}>
+                    Droplet size distribution every N frames (0 = off):
+                </label>
+                <input
+                    id="dist-interval-field"
+                    type="number"
+                    min={0}
+                    step={1}
+                    value={distInterval}
+                    onChange={(e) => {
+                        const v = parseInt(e.target.value, 10);
+                        setDistInterval(Number.isNaN(v) || v < 0 ? 0 : v);
+                    }}
+                    style={{ width: 80 }}
+                />
+            </div>
             <div className="submit-section">
                 <button
                     id="run-btn"
-                    onClick={(ev) => handleSubmit(ev, videoPath, isSegmentationOn)}
+                    onClick={(ev) => handleSubmit(ev, videoPath, isSegmentationOn, distInterval)}
                     disabled={loading || videoPath === ""}
                 >
                     {loading ? "Processing..." : "Run Detection"}
