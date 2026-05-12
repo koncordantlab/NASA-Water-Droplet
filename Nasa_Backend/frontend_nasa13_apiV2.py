@@ -5,6 +5,9 @@ import cv2
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import torch
 import dash
 from dash import html, dcc, Input, Output, State, no_update
@@ -14,6 +17,8 @@ from ultralytics import YOLO
 from flask import request, jsonify, send_file, url_for
 from flask_cors import CORS
 import threading
+import traceback
+import urllib.parse
 import uuid
 import json
 from queue import Queue, Empty
@@ -25,7 +30,7 @@ if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
 # ── 1) Model & Helper Functions ─────────────────────────────────────────────
-MODEL_PATH = r"app_root/weights_DP(6).pt"
+MODEL_PATH = r"app_root/weights_DP(8).pt"
 model      = YOLO(MODEL_PATH)
 model.to(device)
 
@@ -257,7 +262,107 @@ def _droplet_stats_block(values, edges=None):
     }
 
 
-def process_video(video_path: str, save_ovl: bool = True, dist_interval: int = 0, progress_callback = None):
+# Plot colors mirror the SummaryPage UI conventions
+# (blue = water, red = ice, green = water-ice overlap).
+_WATER_PLOT_COLOR = "#1f77b4"
+_ICE_PLOT_COLOR = "#d62728"
+_WI_OVERLAP_PLOT_COLOR = "#2ca02c"
+
+
+def _save_chart_pngs(df, charts, overlap_totals, charts_dir):
+    """Render the SummaryPage's line plots, donuts, and overlap totals to disk.
+    Headless via Agg backend. Output is a matplotlib reconstruction of the
+    Plotly figures; styling won't be pixel-identical to the in-browser charts.
+    """
+    os.makedirs(charts_dir, exist_ok=True)
+    x = charts["pct"]["x"]
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(x, charts["pct"]["water"], color=_WATER_PLOT_COLOR, marker="o", label="Water (%)")
+    ax.plot(x, charts["pct"]["ice"], color=_ICE_PLOT_COLOR, marker="o", label="Ice (%)")
+    ax.set_xlabel("Processed Frame (≈ 1 FPS)")
+    ax.set_ylabel("%")
+    ax.set_title("Water & Ice (%)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(charts_dir, "water_ice_pct.png"), dpi=150)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(x, charts["ov"]["ww"], color=_WATER_PLOT_COLOR, marker="o", label="Water–Water")
+    ax.plot(x, charts["ov"]["ii"], color=_ICE_PLOT_COLOR, marker="o", label="Ice–Ice")
+    ax.plot(x, charts["ov"]["wi"], color=_WI_OVERLAP_PLOT_COLOR, marker="o", label="Water–Ice")
+    ax.set_xlabel("Processed Frame (≈ 1 FPS)")
+    ax.set_ylabel("Overlap count")
+    ax.set_title("Overlap Counts")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(charts_dir, "overlap_counts.png"), dpi=150)
+    plt.close(fig)
+
+    donuts = charts["donuts"]
+
+    # Water Count single-slice donut — matches the UI's label-card behavior;
+    # skip when zero (the React panel hides itself in that case).
+    if donuts.get("water_count", 0) > 0:
+        fig, ax = plt.subplots(figsize=(4, 4))
+        ax.pie([donuts["water_count"]], labels=[f"Water: {donuts['water_count']}"],
+               colors=[_WATER_PLOT_COLOR], wedgeprops=dict(width=0.4))
+        ax.set_title("Water Count")
+        fig.tight_layout()
+        fig.savefig(os.path.join(charts_dir, "donut_water_count.png"), dpi=150)
+        plt.close(fig)
+
+    if donuts.get("ice_count", 0) > 0:
+        fig, ax = plt.subplots(figsize=(4, 4))
+        ax.pie([donuts["ice_count"]], labels=[f"Ice: {donuts['ice_count']}"],
+               colors=[_ICE_PLOT_COLOR], wedgeprops=dict(width=0.4))
+        ax.set_title("Ice Count")
+        fig.tight_layout()
+        fig.savefig(os.path.join(charts_dir, "donut_ice_count.png"), dpi=150)
+        plt.close(fig)
+
+    void = max(0.0, min(100.0, float(donuts.get("void_pct_avg", 0.0))))
+    fig, ax = plt.subplots(figsize=(4, 4))
+    ax.pie([void, 100 - void], labels=[f"Void: {void:.1f}%", "Rest"],
+           colors=["#7f7f7f", "#d9d9d9"], wedgeprops=dict(width=0.4))
+    ax.set_title("Void (%)")
+    fig.tight_layout()
+    fig.savefig(os.path.join(charts_dir, "donut_void_pct.png"), dpi=150)
+    plt.close(fig)
+
+    conf = max(0.0, min(100.0, float(donuts.get("avg_conf", 0.0))))
+    fig, ax = plt.subplots(figsize=(4, 4))
+    ax.pie([conf, 100 - conf], labels=[f"Avg Conf: {conf:.1f}%", "Rest"],
+           colors=["#9467bd", "#d9d9d9"], wedgeprops=dict(width=0.4))
+    ax.set_title("Avg Confidence (%)")
+    fig.tight_layout()
+    fig.savefig(os.path.join(charts_dir, "donut_avg_conf.png"), dpi=150)
+    plt.close(fig)
+
+
+VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".wmv"}
+
+
+def _list_videos_in_dir(directory):
+    """Return sorted absolute paths of video files directly inside `directory`
+    (non-recursive). Extensions matched case-insensitively against VIDEO_EXTENSIONS.
+    """
+    if not os.path.isdir(directory):
+        return []
+    out = []
+    for name in sorted(os.listdir(directory)):
+        full = os.path.join(directory, name)
+        if not os.path.isfile(full):
+            continue
+        if os.path.splitext(name)[1].lower() in VIDEO_EXTENSIONS:
+            out.append(full)
+    return out
+
+
+def process_video(video_path: str, save_ovl: bool = True, dist_interval: int = 0, output_dir: str = None, progress_callback = None):
     """Process the video and return (msg, excel_path, rows, overlap_totals, charts, execution_time, size_distribution)
 
     charts is a dict containing JSON-friendly arrays for plotting:
@@ -289,8 +394,16 @@ def process_video(video_path: str, save_ovl: bool = True, dist_interval: int = 0
     stride = int(round(video_fps)) if video_fps > 0 else 1
     BATCH_SIZE = 4
     frame_batch, frame_count_batch = [], []
-    base_dir, video_fname = os.path.dirname(video_path), os.path.basename(video_path)
+    video_fname = os.path.basename(video_path)
     video_fname_base = os.path.splitext(video_fname)[0]
+    # output_dir overrides the default "next to the input video" location used in
+    # file-mode. Batch-mode callers pass a per-video subdirectory here so the
+    # Excel, charts/, and overlay all land together.
+    if output_dir:
+        base_dir = output_dir
+        os.makedirs(base_dir, exist_ok=True)
+    else:
+        base_dir = os.path.dirname(video_path)
     out_video_writer = None
     
     # Manually count frames (more reliable than CAP_PROP_FRAME_COUNT for AVI files)
@@ -310,8 +423,13 @@ def process_video(video_path: str, save_ovl: bool = True, dist_interval: int = 0
             progress_callback({"status": "started", "message": "Video opened successfully. Starting processing..."})
         
         if save_ovl:
-            seg_dir = os.path.join(base_dir, "segmentation results")
-            os.makedirs(seg_dir, exist_ok=True)
+            # Batch-mode (output_dir set): overlay goes directly in the per-video
+            # folder. File-mode: keep the legacy "segmentation results/" subfolder.
+            if output_dir:
+                seg_dir = base_dir
+            else:
+                seg_dir = os.path.join(base_dir, "segmentation results")
+                os.makedirs(seg_dir, exist_ok=True)
             h, w = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             output_video_path = os.path.join(seg_dir, f"{video_fname_base}_overlay.mp4")
             out_video_writer = cv2.VideoWriter(output_video_path, cv2.VideoWriter_fourcc(*'mp4v'), 10, (w, h))
@@ -448,7 +566,6 @@ def process_video(video_path: str, save_ovl: bool = True, dist_interval: int = 0
 
         df = pd.DataFrame(rows)
         excel_path = os.path.join(base_dir, f"{video_fname_base}_detection_summary.xlsx")
-        df.to_excel(excel_path, index=False)
 
         # prepare chart-friendly payload
         x = [r["Frame Number"] for r in rows]
@@ -462,6 +579,30 @@ def process_video(video_path: str, save_ovl: bool = True, dist_interval: int = 0
             "ov": {"x": x, "ww": ov_ww, "ii": ov_ii, "wi": ov_wi},
             "donuts": {"water_count": int(df["water_cnt"].sum()), "ice_count": int(df["ice_cnt"].sum()), "void_pct_avg": float(df["void_pct"].mean()), "avg_conf": float(df["avg_conf"].mean())}
         }
+
+        overlap_totals_df = pd.DataFrame([{
+            "Water-Water": int(overlap_totals.get("ww", 0)),
+            "Ice-Ice": int(overlap_totals.get("ii", 0)),
+            "Water-Ice": int(overlap_totals.get("mixed", 0)),
+        }])
+        summary_df = pd.DataFrame([{
+            "water_count_total": int(charts["donuts"]["water_count"]),
+            "ice_count_total": int(charts["donuts"]["ice_count"]),
+            "void_pct_avg": float(charts["donuts"]["void_pct_avg"]),
+            "avg_conf_mean": float(charts["donuts"]["avg_conf"]),
+        }])
+        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="Per-Frame", index=False)
+            overlap_totals_df.to_excel(writer, sheet_name="Overlap Totals", index=False)
+            summary_df.to_excel(writer, sheet_name="Summary", index=False)
+
+        # Best-effort PNG dump — never fail the run on render errors.
+        charts_dir = os.path.join(base_dir, f"{video_fname_base}_charts")
+        try:
+            _save_chart_pngs(df, charts, overlap_totals, charts_dir)
+            print(f"📊 Saved chart PNGs to {charts_dir}")
+        except Exception as chart_err:
+            print(f"⚠️  Failed to save chart PNGs ({chart_err}); continuing.")
 
         size_distribution = None
         if dist_interval > 0:
@@ -539,11 +680,22 @@ def api_process():
         dist_interval = 0
     if not video_path:
         return jsonify({"status": "error", "message": "Missing video_path"}), 400
-    
+    if not (os.path.isfile(video_path) or os.path.isdir(video_path)):
+        return jsonify({"status": "error", "message": f"Path is neither a file nor a directory: {video_path}"}), 400
+
     task_id = uuid.uuid4().hex
     task_queue = Queue()
     tasks[task_id] = {"queue": task_queue, "completed": False, "status": "queued"}
-    
+
+    # url_for(_external=True) needs a Flask request context, which the worker
+    # thread doesn't have. Capture the host here and build URLs by string concat.
+    host_url = request.host_url.rstrip('/')
+
+    def _build_download_url(excel_path):
+        if not excel_path:
+            return None
+        return f"{host_url}/api/download_summary?path={urllib.parse.quote(str(excel_path))}"
+
     def worker():
         try:
             def push(ev):
@@ -554,21 +706,127 @@ def api_process():
                         task_queue.put_nowait({"message": str(ev)})
                     except Exception:
                         pass
-            
-            msg, excel_path, rows, overlaps, charts, execution_time, size_distribution = process_video(video_path, save_ovl, dist_interval=dist_interval, progress_callback=push)
-            result_payload = {
-                "status": "ok" if excel_path else "error",
-                "message": str(msg),
-                "charts": make_json_serializable(charts) if charts else None,
-                "rows": make_json_serializable(rows) if rows else None,
-                "overlaps": make_json_serializable(overlaps) if overlaps else None,
-                "excel_path": str(excel_path) if excel_path else None,
-                "download_url": url_for('api_download_summary', path=excel_path, _external=True) if excel_path else None,
-                "execution_time": execution_time,
-                "size_distribution": make_json_serializable(size_distribution) if size_distribution else None,
-            }
-            task_queue.put_nowait({"status": "finished", "data": result_payload})
+
+            def _single_video_payload(msg, excel_path, rows, overlaps, charts, execution_time, size_distribution):
+                return {
+                    "status": "ok" if excel_path else "error",
+                    "message": str(msg),
+                    "charts": make_json_serializable(charts) if charts else None,
+                    "rows": make_json_serializable(rows) if rows else None,
+                    "overlaps": make_json_serializable(overlaps) if overlaps else None,
+                    "excel_path": str(excel_path) if excel_path else None,
+                    "download_url": _build_download_url(excel_path),
+                    "execution_time": execution_time,
+                    "size_distribution": make_json_serializable(size_distribution) if size_distribution else None,
+                }
+
+            if os.path.isdir(video_path):
+                # Batch mode: process every video in the directory, sequentially.
+                videos = _list_videos_in_dir(video_path)
+                print(f"📂 Batch mode: found {len(videos)} video(s) in {video_path}")
+                for _v in videos:
+                    print(f"   - {_v}")
+                if not videos:
+                    push({"status": "error", "message": f"No video files found in directory: {video_path}"})
+                    task_queue.put_nowait({"status": "error", "message": f"No video files found in directory: {video_path}"})
+                    return
+
+                batch_results = []
+                last_payload = None
+                total = len(videos)
+                for idx, vid in enumerate(videos, start=1):
+                    print(f"▶️  [{idx}/{total}] Starting {os.path.basename(vid)}")
+                    stem = os.path.splitext(os.path.basename(vid))[0]
+                    out_dir = os.path.join(video_path, stem)
+                    vid_name = os.path.basename(vid)
+                    push({
+                        "status": "video_started",
+                        "message": f"Processing video {idx}/{total}: {vid_name}",
+                        "video_index": idx,
+                        "video_total": total,
+                        "current_video": vid_name,
+                    })
+
+                    # Stamp every event with batch position, convert per-video
+                    # progress into global progress, and demote intermediate
+                    # "completed" events so the frontend doesn't close the SSE
+                    # after the first video finishes.
+                    def video_push(ev, _idx=idx, _total=total, _name=vid_name):
+                        if not isinstance(ev, dict):
+                            push(ev)
+                            return
+                        ev = dict(ev)
+                        ev["video_index"] = _idx
+                        ev["video_total"] = _total
+                        ev["current_video"] = _name
+                        if isinstance(ev.get("progress"), (int, float)):
+                            per_video_pct = float(ev["progress"])
+                            ev["progress"] = round(((_idx - 1) + per_video_pct / 100.0) / _total * 100.0, 2)
+                        if ev.get("status") == "completed" and _idx < _total:
+                            ev = {
+                                "status": "video_completed",
+                                "message": ev.get("message") or f"Finished {_name}",
+                                "execution_time": ev.get("execution_time"),
+                                "excel_path": ev.get("excel_path"),
+                                "video_index": _idx,
+                                "video_total": _total,
+                                "current_video": _name,
+                                "progress": round((_idx / _total) * 100.0, 2),
+                            }
+                        push(ev)
+
+                    # Per-video try/except so one failure can't kill the whole batch.
+                    # process_video has its own internal try/except for the main work,
+                    # but the cv2 capture-open and frame-counting steps live outside
+                    # that block and can still raise.
+                    try:
+                        msg, excel_path, rows, overlaps, charts, exec_time, size_dist = process_video(
+                            vid, save_ovl,
+                            dist_interval=dist_interval,
+                            output_dir=out_dir,
+                            progress_callback=video_push,
+                        )
+                    except Exception as per_vid_err:
+                        print(f"⚠️  Video {idx}/{total} ({vid_name}) raised: {per_vid_err!r}")
+                        push({
+                            "status": "error",
+                            "message": f"Video {vid_name} failed: {per_vid_err}",
+                            "video_index": idx,
+                            "video_total": total,
+                            "current_video": vid_name,
+                        })
+                        msg, excel_path = f"❌ {per_vid_err}", None
+                        rows = overlaps = charts = size_dist = None
+                        exec_time = None
+
+                    batch_results.append({
+                        "video": vid_name,
+                        "video_path": vid,
+                        "output_dir": out_dir,
+                        "status": "ok" if excel_path else "error",
+                        "message": str(msg),
+                        "excel_path": str(excel_path) if excel_path else None,
+                        "download_url": _build_download_url(excel_path),
+                        "execution_time": exec_time,
+                    })
+                    if excel_path:
+                        last_payload = _single_video_payload(msg, excel_path, rows, overlaps, charts, exec_time, size_dist)
+
+                final_payload = last_payload or {"status": "error", "message": "All videos failed"}
+                final_payload["batch_results"] = batch_results
+                final_payload["batch_total"] = total
+                task_queue.put_nowait({"status": "finished", "data": final_payload})
+            else:
+                # File mode (unchanged behavior).
+                msg, excel_path, rows, overlaps, charts, execution_time, size_distribution = process_video(
+                    video_path, save_ovl, dist_interval=dist_interval, progress_callback=push
+                )
+                task_queue.put_nowait({"status": "finished", "data": _single_video_payload(
+                    msg, excel_path, rows, overlaps, charts, execution_time, size_distribution
+                )})
         except Exception as e:
+            print(f"❌ Worker fatal: {e!r}")
+            traceback.print_exc()
             task_queue.put_nowait({"status": "error", "message": f"An error occurred: {e}"})
         finally:
             tasks[task_id]["completed"] = True
