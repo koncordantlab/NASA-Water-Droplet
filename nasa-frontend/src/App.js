@@ -36,6 +36,7 @@ export default function App() {
   const [overlaps, setOverlaps] = useState(null);
   const [downloadUrl, setDownloadUrl] = useState(null);
   const [executionTime, setExecutionTime] = useState(null);
+  const [sizeDistribution, setSizeDistribution] = useState(null);
 
   // slider state
   const [sliderMax, setSliderMax] = useState(1);
@@ -57,7 +58,7 @@ export default function App() {
     setSliderValue(n);
   }, [rows]);
 
-  const handleSubmit = async (ev, videoPath, isSegmentationOn) => {
+  const handleSubmit = async (ev, videoPath, isSegmentationOn, distInterval = 0) => {
     if (ev && ev.preventDefault) ev.preventDefault();
 
     setError(null);
@@ -75,11 +76,16 @@ export default function App() {
     setOverlaps(null);
     setDownloadUrl(null);
     setExecutionTime(null);
+    setSizeDistribution(null);
     try {
       const resp = await fetch(`${process.env.REACT_APP_BACKEND_API_URL}/process`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ video_path: videoPath, save_overlay: isSegmentationOn }),
+        body: JSON.stringify({
+          video_path: videoPath,
+          save_overlay: isSegmentationOn,
+          dist_interval: Number(distInterval) || 0,
+        }),
       });
 
       const data = await resp.json();
@@ -112,6 +118,7 @@ export default function App() {
         setOverlaps(data.overlap_totals || null);
         setDownloadUrl(data.download_url || data.excel_path || null);
         setExecutionTime(data.execution_time || null);
+        setSizeDistribution(data.size_distribution || null);
         setLoading(false);
         setProgressModal(false);
 
@@ -194,8 +201,8 @@ export default function App() {
           </Box>
         </NoCloseModal>
       )}
-      { pathname === "/summary" ? 
-        <SummaryPage 
+      { pathname === "/summary" ?
+        <SummaryPage
           rows={rows}
           overlaps={overlaps}
           markPlotRendered={markPlotRendered}
@@ -207,6 +214,7 @@ export default function App() {
           executionTime={executionTime}
           setSliderValue={setSliderValue}
           plotsRendered={plotsRendered}
+          sizeDistribution={sizeDistribution}
         /> : <HomePage loading={loading} handleSubmit={handleSubmit} downloadUrl={downloadUrl} error={error} />}
     </>
   );
